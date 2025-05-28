@@ -1,1 +1,125 @@
-# github-action-project
+name: Deploy PHP Website to AWS EC2
+
+on: workflow_dispatch
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    outputs:
+      public_ip: ${{ steps.get-ip.outputs.public_ip }}
+
+    steps:
+    - name: Checkout Deployment Repo
+      uses: actions/checkout@v3
+
+    - name: Create or Reuse Security Group
+      id: sg
+      run: |
+        echo "Checking for existing security group..."
+        VPC_ID=$(aws ec2 describe-vpcs \
+          --filters "Name=isDefault,Values=true" \
+          --query "Vpcs[0].VpcId" --output text --region $AWS_REGION)
+
+        SG_ID=$(aws ec2 describe-security-groups \
+          --filters Name=group-name,Values=github-deploy-sg-v2 Name=vpc-id,Values=$VPC_ID \
+          --query "SecurityGroups[0].GroupId" --output text --region $AWS_REGION 2>/dev/null)
+
+        if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
+          echo "Security group not found. Creating a new one..."
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name github-deploy-sg-v2 \
+            --description "Allow SSH and HTTP access" \
+            --vpc-id $VPC_ID \
+            --region $AWS_REGION \
+            --query "GroupId" --output text)
+
+          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0 --region $AWS_REGION
+          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 80 --cidr 0.0.0.0/0 --region $AWS_REGION
+          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 443 --cidr 0.0.0.0/0 --region $AWS_REGION
+        else
+          echo "Security group already exists: $SG_ID"
+        fi
+
+        echo "SG_ID=$SG_ID" >> $GITHUB_ENV
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION: ${{ secrets.AWS_REGION }}
+
+    - name: Launch EC2 Instance
+      id: launch-ec2
+      run: |
+        echo "Launching EC2 instance..."
+        INSTANCE_ID=$(aws ec2 run-instances \
+          --image-id ami-03bb6d83c60fc5f7c \
+          --count 1 \
+          --instance-type t2.micro \
+          --key-name github-deploy-key \
+          --security-group-ids $SG_ID \
+          --region $AWS_REGION \
+          --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=GitHubDeploy}]' \
+          --query "Instances[0].InstanceId" \
+          --output text)
+
+        echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+
+        echo "Waiting for EC2 to be running..."
+        aws ec2 wait instance-running --instance-ids $INSTANCE_ID --region $AWS_REGION
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION: ${{ secrets.AWS_REGION }}
+
+    - name: Get Public IP
+      id: get-ip
+      run: |
+        PUBLIC_IP=$(aws ec2 describe-instances \
+          --filters "Name=tag:Name,Values=GitHubDeploy" \
+          --query "Reservations[0].Instances[0].PublicIpAddress" \
+          --region $AWS_REGION \
+          --output text)
+
+        echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+        echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION: ${{ secrets.AWS_REGION }}
+
+    - name: Save EC2 Private Key
+      run: |
+        echo "${{ secrets.EC2_KEY }}" > ec2-key.pem
+        chmod 400 ec2-key.pem
+
+    - name: Wait for SSH to be Ready
+      run: sleep 30
+
+    - name: Install Apache, PHP 8.1, and MySQL
+      run: |
+        ssh -o StrictHostKeyChecking=no -i ec2-key.pem ubuntu@$PUBLIC_IP <<EOF
+          sudo apt update
+          sudo apt install -y apache2 php8.1 php8.1-cli php8.1-mysql mysql-server unzip git
+          sudo systemctl enable --now apache2
+          sudo systemctl enable --now mysql
+        EOF
+
+    - name: Clone and Deploy Your PHP Website
+      run: |
+        ssh -o StrictHostKeyChecking=no -i ec2-key.pem ubuntu@$PUBLIC_IP <<EOF
+          cd /tmp
+          git clone https://github.com/AryanSharma2206/gym-website.git site
+          sudo rm -rf /var/www/html/*
+          sudo cp -r site/* /var/www/html/
+          sudo chown -R www-data:www-data /var/www/html
+          echo "<?php phpinfo(); ?>" | sudo tee /var/www/html/phpinfo.php
+          sudo systemctl restart apache2
+        EOF
+
+    # Optional: Terminate EC2 Instance After Job
+    # - name: Terminate EC2 Instance
+    #   if: always()
+    #   run: aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region $AWS_REGION
+    #   env:
+    #     AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+    #     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    #     AWS_REGION: ${{ secrets.AWS_REGION }}
